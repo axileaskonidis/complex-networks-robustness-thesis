@@ -32,7 +32,18 @@ Install dependencies with:
 ```bash
 pip install -r requirements.txt
 ```
+
 Data
+
 https://snap.stanford.edu/data/soc-sign-bitcoin-otc.html
+
 https://snap.stanford.edu/data/soc-sign-bitcoin-alpha.html
+
+The code expects CSV files with columns such as:
+SOURCE, TARGET, RATING, TIME
+
+
+Author
+
+Axilleas Konstantinidis
 
