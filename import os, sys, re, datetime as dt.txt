@@ -1,0 +1,739 @@
+import os, sys, re, datetime as dt
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from sklearn.metrics import normalized_mutual_info_score
+from collections import Counter
+import random
+
+#   PLOTS CAPTURE
+RUN_TS = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = os.path.join("runs", RUN_TS)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+LOG_FILE = os.path.join(OUTPUT_DIR, "run.log.txt")
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+# redirect stdout & stderr to both console and log file
+_log_fh = open(LOG_FILE, "w", encoding="utf-8")
+sys.stdout = Tee(sys.stdout, _log_fh)
+sys.stderr = Tee(sys.stderr, _log_fh)
+
+print(f"[INFO] Output folder: {OUTPUT_DIR}")
+print(f"[INFO] Log file     : {LOG_FILE}")
+
+# Helper to save plots automatically
+PLOT_INDEX = 0
+def _slug(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^\w\-\.]+", "", s)
+    return s or "plot"
+
+def savefig_show(extra_name: str = ""):
+    """Save current figure into OUTPUT_DIR with incremental index, using its title if available, then show."""
+    global PLOT_INDEX
+    fig = plt.gcf()
+    title = ""
+    if fig.axes:
+        try:
+            title = fig.axes[0].get_title() or ""
+        except Exception:
+            title = ""
+    PLOT_INDEX += 1
+    base = f"{PLOT_INDEX:03d}_{_slug(title)}"
+    if extra_name:
+        base += "_" + _slug(extra_name)
+    out_path = os.path.join(OUTPUT_DIR, base + ".png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    print(f"[PLOT SAVED] {out_path}")
+    plt.show()
+
+def save_table(df: pd.DataFrame, filename: str):
+    """Save a dataframe as CSV into the OUTPUT_DIR and log it."""
+    path = os.path.join(OUTPUT_DIR, filename)
+    df.to_csv(path, index=False)
+    print(f"[TABLE SAVED] {path}")
+
+#  TOGGLES
+RUN_BASE_ANALYSIS = False         # Τρέχει την ανάλυση για aggregated + πραγματικά per-year δίκτυα
+RUN_NULL_MODELS   = True         # Τρέχει τα 8 null δίκτυα ανά έτος για YEARS_FOR_NULLS
+
+# Null models 2011–2014
+YEARS_FOR_NULLS   = [2011, 2012, 2013, 2014]
+N_NULLS_PER_YEAR  = 8
+REWIRES_PER_EDGE  = 5            # πόσα edge-swaps ανά ακμή για τυχαιοποίηση
+NULL_RANDOM_SEED  = 123
+
+# Γενικές ρυθμίσεις
+DECIMALS = 4
+DRAW_FULL_GRAPH_PER_YEAR = False  # σχεδίαση per-year (βαρύ)
+ADAPTIVE = True                   # recompute scores στις επιθέσεις
+MAX_STEPS = 200                   # guard για runtime
+STOP_FRAC = 0.50                  # όριο failure (50% του baseline)
+PLOT_PER_YEAR = True              # plots ανά έτος / null
+
+# HELPERS
+def fmt(x, d=DECIMALS):
+    try:
+        return f"{x:.{d}f}"
+    except Exception:
+        return str(x)
+
+def print_header(title):
+    bar = "-" * max(20, len(title))
+    print(f"\n{bar}\n{title}\n{bar}")
+
+def print_year_summary(year, wcc_nodes, scc_nodes, n_communities, nmi=None):
+    line = f"Year {year}: WCC={wcc_nodes} nodes | SCC={scc_nodes} nodes | Communities={n_communities}"
+    if nmi is not None:
+        line += f" | NMI prev={fmt(nmi)}"
+    print(line)
+
+def print_top_list(title, pairs, k=5):
+    print(f"  {title}:")
+    for i, (node, val) in enumerate(pairs[:k], 1):
+        print(f"    {i:>2}. node {node:<10} {fmt(val)}")
+
+# Community detection (Leiden)
+def leiden_partition_directed_weighted(G_dir, weight_attr="weight", seed=42, resolution=None):
+    try:
+        import igraph as ig
+        import leidenalg as la
+    except ImportError as e:
+        raise ImportError("Please install igraph and leidenalg: pip install igraph leidenalg") from e
+
+    nodes = list(G_dir.nodes())
+    idx = {n: i for i, n in enumerate(nodes)}
+
+    g = ig.Graph(directed=True)
+    g.add_vertices(len(nodes))
+    g.vs["name"] = nodes
+
+    edges = [(idx[u], idx[v]) for u, v in G_dir.edges()]
+    g.add_edges(edges)
+
+    weights = [float(G_dir[u][v].get(weight_attr, 1.0)) for u, v in G_dir.edges()]
+    g.es["weight"] = weights
+
+    if resolution is None:
+        part = la.find_partition(g, la.ModularityVertexPartition, weights=g.es["weight"], seed=seed)
+    else:
+        part = la.find_partition(g, la.CPMVertexPartition, weights=g.es["weight"],
+                                 resolution_parameter=resolution, seed=seed)
+
+    membership = part.membership
+    return {node: comm for node, comm in zip(nodes, membership)}
+
+# ========= Builders (aggregation χωρίς iterrows) =========
+def aggregate_edges_df(df_sub: pd.DataFrame) -> pd.DataFrame:
+    """
+    Επιστρέφει aggregated dataframe ανά (SOURCE,TARGET) με:
+      weight=sum(|rating|), rating_sum, edge_count, rating=mean, cost=1/(weight+1),
+      first_time, last_time
+    """
+    grp = (df_sub
+           .assign(abs_rating=lambda x: x['RATING'].abs())
+           .groupby(['SOURCE', 'TARGET'], as_index=False)
+           .agg(
+               weight=('abs_rating', 'sum'),
+               rating_sum=('RATING', 'sum'),
+               edge_count=('RATING', 'size'),
+               first_time=('TIME', 'min'),
+               last_time=('TIME', 'max'),
+           ))
+    grp['rating'] = grp['rating_sum'] / grp['edge_count']
+    grp['cost'] = 1.0 / (grp['weight'] + 1.0)
+    return grp
+
+def build_digraph_from_aggregated_df(grp: pd.DataFrame) -> nx.DiGraph:
+    """Χτίζει DiGraph από aggregated dataframe (μία ακμή ανά (u,v))."""
+    Gx = nx.DiGraph()
+    Gx.add_edges_from([
+        (int(row['SOURCE']), int(row['TARGET']),
+         {
+            'weight': float(row['weight']),
+            'rating_sum': float(row['rating_sum']),
+            'count': int(row['edge_count']),   # use edge_count to avoid Series.count clash
+            'rating': float(row['rating']),    # mean rating
+            'cost': float(row['cost']),
+            'first_time': row['first_time'],
+            'last_time': row['last_time']
+         })
+        for _, row in grp.iterrows()
+    ])
+    return Gx
+
+#  Faster betweenness for large graphs
+def betweenness_cost_weighted(Gdir: nx.DiGraph):
+    n = Gdir.number_of_nodes()
+    if n > 1500:
+        k = min(300, n)  # approximation for speed
+        return nx.betweenness_centrality(Gdir, weight="cost", normalized=True, k=k, seed=42)
+    return nx.betweenness_centrality(Gdir, weight="cost", normalized=True)
+
+#  Robustness helpers
+def avg_spl_scc_cost_exact(Gdir: nx.DiGraph):
+    """Μέσο μήκος συντομότερου μονοπατιού στο μεγαλύτερο SCC (cost-weighted)."""
+    if Gdir.number_of_nodes() == 0:
+        return float("nan")
+    try:
+        scc_nodes = max(nx.strongly_connected_components(Gdir), key=len)
+    except ValueError:
+        return float("nan")
+    H = Gdir.subgraph(scc_nodes).copy()
+    if H.number_of_nodes() < 2:
+        return float("nan")
+    return nx.average_shortest_path_length(H, weight="cost")
+
+def score_nodes(Gdir, strategy, rnd=None):
+    if Gdir.number_of_nodes() == 0:
+        return {}
+    if strategy == "betweenness":
+        return nx.betweenness_centrality(Gdir, weight="cost", normalized=True)
+    elif strategy == "in_strength":
+        return dict(Gdir.in_degree(weight="weight"))
+    elif strategy == "out_strength":
+        return dict(Gdir.out_degree(weight="weight"))
+    elif strategy == "random":
+        if rnd is None:
+            rnd = random.Random(42)
+        return {n: rnd.random() for n in Gdir.nodes()}
+    else:
+        raise ValueError("Unknown strategy")
+
+def normalized_trapz(y):
+    m = len(y)
+    if m == 0:
+        return float('nan')
+    if m == 1:
+        return float(y[0])
+    s = 0.0
+    for i in range(1, m):
+        s += 0.5 * (y[i-1] + y[i])
+    return s / (m - 1)
+
+def run_targeted_attack(G_original, strategy,
+                        adaptive=ADAPTIVE, max_steps=MAX_STEPS,
+                        stop_frac=STOP_FRAC, rng_seed=42, tag=None):
+    G = G_original.copy()
+    rnd = random.Random(rng_seed)
+    try:
+        base_wcc = len(max(nx.weakly_connected_components(G), key=len))
+    except ValueError:
+        base_wcc = 0
+    try:
+        base_scc = len(max(nx.strongly_connected_components(G), key=len))
+    except ValueError:
+        base_scc = 0
+
+    print_header(f"Attack strategy: {strategy}{(' — ' + tag) if tag else ''}")
+    print(f"Baseline WCC={base_wcc} nodes | SCC={base_scc} nodes")
+
+    scores = None if adaptive else score_nodes(G, strategy, rnd)
+    rows = []
+    for step in range(1, min(max_steps, G.number_of_nodes()) + 1):
+        if G.number_of_nodes() == 0:
+            print("No nodes left to remove.")
+            break
+        if adaptive:
+            scores = score_nodes(G, strategy, rnd)
+        if not scores:
+            print("No nodes to score/remove.")
+            break
+
+        node, node_score = max(scores.items(), key=lambda kv: (kv[1], str(kv[0])))
+        if node not in G:
+            scores.pop(node, None)
+            continue
+
+        G.remove_node(node)
+
+        try:
+            wcc_size = len(max(nx.weakly_connected_components(G), key=len))
+        except ValueError:
+            wcc_size = 0
+        try:
+            scc_size = len(max(nx.strongly_connected_components(G), key=len))
+        except ValueError:
+            scc_size = 0
+
+        wcc_frac = (wcc_size / base_wcc) if base_wcc else 0.0
+        scc_frac = (scc_size / base_scc) if base_scc else 0.0
+        asp_cost = avg_spl_scc_cost_exact(G)
+
+        rows.append({
+            "step": step,
+            "removed_node": node,
+            "removed_score": node_score,
+            "nodes_remaining": G.number_of_nodes(),
+            "edges_remaining": G.number_of_edges(),
+            "wcc_nodes": wcc_size,
+            "wcc_fraction": wcc_frac,
+            "scc_nodes": scc_size,
+            "scc_fraction": scc_frac,
+            "asp_cost": asp_cost,
+        })
+
+        print(
+            f"Step {step:>3} | removed node {node} (score={fmt(node_score)})  "
+            f"| WCC {wcc_size} ({fmt(wcc_frac)})  "
+            f"| SCC {scc_size} ({fmt(scc_frac)})  "
+            f"| ASP(SCC,cost) {fmt(asp_cost)}"
+        )
+
+        if (wcc_frac <= stop_frac) or (scc_frac <= stop_frac) or (wcc_size <= 1) or (scc_size <= 1):
+            print(f"Stopped: break condition met (≤ {int(stop_frac*100)}% of baseline).")
+            break
+
+        if not adaptive:
+            scores.pop(node, None)
+
+    df_attack = pd.DataFrame(rows)
+    auc_wcc = normalized_trapz(df_attack["wcc_fraction"].tolist())
+    auc_scc = normalized_trapz(df_attack["scc_fraction"].tolist())
+    return df_attack, auc_wcc, auc_scc
+
+#  Null models (rewire + attribute re-assignment)
+def _directed_rewire_preserve_degree(G_in: nx.DiGraph, rewire_per_edge=5, seed=42):
+    """
+    Προσπαθεί degree-preserving rewiring με directed_edge_swap.
+    Επιστρέφει νέο DiGraph με ίδια nodes/edges, διαφορετική τοπολογία.
+    """
+    H = nx.DiGraph()
+    H.add_nodes_from(G_in.nodes())
+    H.add_edges_from(G_in.edges())  # ξεκινάμε από την ίδια τοπολογία
+
+    try:
+        from networkx.algorithms.swap import directed_edge_swap
+        m = H.number_of_edges()
+        nswap = max(1, rewire_per_edge * m)
+        directed_edge_swap(H, nswap=nswap, max_tries=nswap * 10, seed=seed)  # in-place
+        return H
+    except Exception:
+        # Fallback: στοχαστικό stub-matching
+        rng = random.Random(seed)
+        out_deg = {n: G_in.out_degree(n) for n in G_in.nodes()}
+        in_deg  = {n: G_in.in_degree(n)  for n in G_in.nodes()}
+        sources = [u for u, k in out_deg.items() for _ in range(k)]
+        targets = [v for v, k in in_deg.items()  for _ in range(k)]
+        if len(sources) != len(targets):
+            raise ValueError("Stub counts mismatch in fallback rewiring.")
+
+        for _ in range(10):
+            rng.shuffle(sources); rng.shuffle(targets)
+            edges = set(); ok = True
+            for u, v in zip(sources, targets):
+                if u == v or (u, v) in edges:
+                    ok = False; break
+                edges.add((u, v))
+            if ok:
+                H = nx.DiGraph()
+                H.add_nodes_from(G_in.nodes())
+                H.add_edges_from(edges)
+                return H
+
+        # Αποδοχή λίγων συγκρούσεων – επιδιόρθωση
+        pairs = list(zip(sources, targets))
+        rng.shuffle(pairs)
+        H = nx.DiGraph(); H.add_nodes_from(G_in.nodes())
+        for u, v in pairs:
+            if u != v and not H.has_edge(u, v):
+                H.add_edge(u, v)
+        while H.number_of_edges() < G_in.number_of_edges():
+            u = rng.choice(list(H.nodes())); v = rng.choice(list(H.nodes()))
+            if u != v and not H.has_edge(u, v):
+                H.add_edge(u, v)
+        return H
+
+def _attributes_multiset(G_in: nx.DiGraph):
+    """Μάζεψε τα attribute tuples από τις ακμές για re-assignment."""
+    attrs = []
+    for _, _, d in G_in.edges(data=True):
+        attrs.append({
+            'weight': d['weight'],
+            'rating': d.get('rating', 0.0),
+            'rating_sum': d.get('rating_sum', d.get('rating', 0.0)),
+            'count': d.get('count', 1),
+            'first_time': d.get('first_time', None),
+            'last_time': d.get('last_time', None),
+        })
+    return attrs
+
+def _assign_attributes_from_bag(G_topo: nx.DiGraph, attr_bag: list, seed=42):
+    """Σε κάθε ακμή του G_topo δίνουμε ένα τυχαίο attribute dict από το attr_bag (ίδια κατανομή)."""
+    rng = random.Random(seed)
+    bag = attr_bag[:]
+    rng.shuffle(bag)
+    if len(bag) < G_topo.number_of_edges():
+        raise ValueError("Attribute bag smaller than edges.")
+    i = 0
+    for u, v in G_topo.edges():
+        a = bag[i]; i += 1
+        cost = 1.0 / (float(a['weight']) + 1.0)
+        G_topo[u][v].update({
+            'weight': float(a['weight']),
+            'rating': float(a['rating']),
+            'rating_sum': float(a['rating_sum']),
+            'count': int(a['count']),
+            'first_time': a['first_time'],
+            'last_time': a['last_time'],
+            'cost': float(cost),
+        })
+    return G_topo
+
+def make_null_graphs_for_year(G_year: nx.DiGraph, n_nulls=8, rewire_per_edge=5, seed=123):
+    """
+    Επιστρέφει λίστα από n_nulls DiGraphs «null» για ένα έτος.
+    - Ίδιοι κόμβοι / ίδιο πλήθος ακμών (και, όπου είναι δυνατό, ίδιο degree-sequence)
+    - Διαφορετική τοπολογία (rewire)
+    - Ίδια κατανομή weight/rating (ανατεθειμένη τυχαία στις νέες ακμές)
+    """
+    bag = _attributes_multiset(G_year)
+    nulls = []
+    for i in range(n_nulls):
+        H_topo = _directed_rewire_preserve_degree(G_year, rewire_per_edge, seed + i)
+        H_attr = _assign_attributes_from_bag(H_topo, bag, seed + 10_000 + i)
+        nulls.append(H_attr)
+    return nulls
+
+#  LOAD DATA =
+file_path = "bitcoinotc.csv"   # <-- άλλαξέ το σε "bitcoinalpha.csv" αν θες
+df = pd.read_csv(file_path, header=None, names=['SOURCE', 'TARGET', 'RATING', 'TIME'])
+df['TIME'] = pd.to_datetime(df['TIME'], unit='s')
+df['YEAR'] = df['TIME'].dt.year
+
+#  BASE ANALYSIS (Aggregated + Per-Year)
+if RUN_BASE_ANALYSIS:
+    # Aggregated FULL graph
+    grp_full = aggregate_edges_df(df)
+    G = build_digraph_from_aggregated_df(grp_full)
+
+    print_header("Full Network Summary (Aggregated)")
+    print(f"Number of nodes: {G.number_of_nodes()}")
+    print(f"Number of edges (aggregated pairs): {G.number_of_edges()}")
+    positive_edges = sum(1 for _, _, d in G.edges(data=True) if d['rating'] > 0)  # mean rating > 0
+    percent_positive = (positive_edges / G.number_of_edges()) * 100 if G.number_of_edges() > 0 else 0
+    print(f"Percentage of positive edges (by mean rating): {fmt(percent_positive)}%")
+
+    # Global Giant Components (aggregated)
+    largest_wcc = max(nx.weakly_connected_components(G), key=len)
+    G_wcc = G.subgraph(largest_wcc).copy()
+    largest_scc = max(nx.strongly_connected_components(G), key=len)
+    G_scc = G.subgraph(largest_scc).copy()
+
+    print_header("Global Giant Component Metrics (Aggregated)")
+    print(f"WCC size: {G_wcc.number_of_nodes()} nodes, {G_wcc.number_of_edges()} edges")
+    print(f"SCC size: {G_scc.number_of_nodes()} nodes, {G_scc.number_of_edges()} edges")
+
+    # Avg shortest path (SCC, cost-weighted)
+    try:
+        avg_path_scc = nx.average_shortest_path_length(G_scc, weight="cost")
+        print(f"Avg shortest path length (SCC, directed, cost-weighted): {fmt(avg_path_scc)}")
+    except Exception as e:
+        print(f"Could not calculate SCC avg shortest path: {e}")
+
+    # Global Centrality (aggregated)
+    print_header("Global Centrality (Directed & Weighted) — Aggregated")
+    in_strength  = dict(G.in_degree(weight='weight'))
+    out_strength = dict(G.out_degree(weight='weight'))
+    betw_cost    = nx.betweenness_centrality(G, weight="cost", normalized=True)
+    print_top_list("Top 5 In-strength (sum |rating|)",  sorted(in_strength.items(),  key=lambda x: x[1], reverse=True)[:5])
+    print_top_list("Top 5 Out-strength (sum |rating|)", sorted(out_strength.items(), key=lambda x: x[1], reverse=True)[:5])
+    print_top_list("Top 5 Betweenness (cost-weighted)", sorted(betw_cost.items(), key=lambda x: x[1], reverse=True)[:5])
+
+    #  Yearly analysis (independent, aggregated per year)
+    by_year = dict(tuple(df.groupby('YEAR', sort=True)))
+    years = sorted(by_year.keys())
+
+    wcc_sizes_nodes, scc_sizes_nodes = [], []
+    wcc_sizes_edges, scc_sizes_edges = [], []
+    nmi_scores, year_pairs = [], []
+    previous_partition, previous_year = None, None
+
+    print_header("Yearly Analysis (Directed & Weighted) — Aggregated per year")
+    for year in years:
+        df_year = by_year[year]
+
+        # per-year aggregation -> per-year DiGraph
+        grp_year = aggregate_edges_df(df_year)
+        G_year = build_digraph_from_aggregated_df(grp_year)
+
+        if G_year.number_of_edges() == 0:
+            print_year_summary(year, 0, 0, 0, nmi=None)
+            wcc_sizes_nodes.append(0); wcc_sizes_edges.append(0)
+            scc_sizes_nodes.append(0); scc_sizes_edges.append(0)
+        else:
+            # WCC & SCC
+            largest_wcc_year = max(nx.weakly_connected_components(G_year), key=len)
+            G_wcc_year = G_year.subgraph(largest_wcc_year).copy()
+            wcc_sizes_nodes.append(G_wcc_year.number_of_nodes())
+            wcc_sizes_edges.append(G_wcc_year.number_of_edges())
+
+            largest_scc_year = max(nx.strongly_connected_components(G_year), key=len)
+            G_scc_year = G_year.subgraph(largest_scc_year).copy()
+            scc_sizes_nodes.append(G_scc_year.number_of_nodes())
+            scc_sizes_edges.append(G_scc_year.number_of_edges())
+
+            # Communities (Leiden) στο WCC
+            partition = leiden_partition_directed_weighted(G_wcc_year, weight_attr="weight", seed=42)
+            n_communities = len(set(partition.values()))
+
+            # NMI με προηγούμενο έτος (στα κοινά nodes)
+            nmi_to_prev = None
+            if previous_partition is not None:
+                common_nodes = set(previous_partition.keys()).intersection(partition.keys())
+                if common_nodes:
+                    prev_labels = [previous_partition[n] for n in common_nodes]
+                    curr_labels = [partition[n] for n in common_nodes]
+                    nmi_to_prev = normalized_mutual_info_score(prev_labels, curr_labels)
+                    nmi_scores.append(nmi_to_prev)
+                    year_pairs.append(f"{previous_year}-{year}")
+
+            print_year_summary(year, G_wcc_year.number_of_nodes(), G_scc_year.number_of_nodes(), n_communities, nmi_to_prev)
+
+            # ASP στο SCC (cost-weighted)
+            try:
+                avg_path_scc_year = nx.average_shortest_path_length(G_scc_year, weight="cost")
+                print(f"  Avg shortest path (SCC, directed, cost-weighted): {fmt(avg_path_scc_year)}")
+            except Exception as e:
+                print(f"  Avg shortest path (SCC) not available: {e}")
+
+            # Community sizes
+            sizes = Counter(partition.values())
+            largest_sizes = sorted(sizes.values(), reverse=True)[:5]
+            print(f"  Community sizes (top 5): {largest_sizes}  | total communities: {len(sizes)}")
+
+            # Per-year centralities στο ΠΛΗΡΕΣ γράφημα έτους
+            in_strength_y  = dict(G_year.in_degree(weight='weight'))
+            out_strength_y = dict(G_year.out_degree(weight='weight'))
+            bet_cent_y     = betweenness_cost_weighted(G_year)
+
+            print_top_list("Top 5 In-strength (sum |rating|)",  sorted(in_strength_y.items(),  key=lambda x: x[1], reverse=True)[:5])
+            print_top_list("Top 5 Out-strength (sum |rating|)", sorted(out_strength_y.items(), key=lambda x: x[1], reverse=True)[:5])
+            print_top_list("Top 5 Betweenness (cost-weighted)", sorted(bet_cent_y.items(), key=lambda x: x[1], reverse=True)[:5])
+
+            # Προαιρετική σχεδίαση
+            if DRAW_FULL_GRAPH_PER_YEAR:
+                plt.figure(figsize=(10, 8))
+                pos = nx.spring_layout(G_year, seed=42)
+                abs_ratings = [d['weight'] for _, _, d in G_year.edges(data=True)]
+                max_w = max(abs_ratings) if abs_ratings else 1.0
+                edge_widths = [0.6 + 2.4 * (w / max_w) for w in abs_ratings]
+                edge_colors = [('green' if d['rating'] > 0 else 'red' if d['rating'] < 0 else 'gray')
+                               for _, _, d in G_year.edges(data=True)]
+                nx.draw_networkx_nodes(G_year, pos, node_size=30, node_color='skyblue', alpha=0.9)
+                nx.draw_networkx_edges(G_year, pos, arrows=True, width=edge_widths, edge_color=edge_colors, alpha=0.6)
+                plt.title(f"Full Graph — Year {year} (Directed, Weighted, aggregated per-year)")
+                plt.axis('off'); plt.tight_layout()
+                savefig_show()
+
+            previous_partition, previous_year = partition, year
+
+    # Summary plots για τα έτη
+    print_header("Summary Plots")
+    if years:
+        plt.figure(figsize=(10, 5))
+        plt.plot(years, wcc_sizes_nodes, marker='o', label="WCC Nodes")
+        plt.plot(years, scc_sizes_nodes, marker='s', label="SCC Nodes")
+        plt.title("Giant Component Sizes Over Time (Nodes)")
+        plt.xlabel("Year"); plt.ylabel("Number of Nodes")
+        plt.legend(); plt.grid(True); plt.tight_layout()
+        savefig_show()
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(years, wcc_sizes_edges, marker='o', label="WCC Edges")
+        plt.plot(years, scc_sizes_edges, marker='s', label="SCC Edges")
+        plt.title("Giant Component Sizes Over Time (Edges)")
+        plt.xlabel("Year"); plt.ylabel("Number of Edges")
+        plt.legend(); plt.grid(True); plt.tight_layout()
+        savefig_show()
+
+        if nmi_scores:
+            plt.figure(figsize=(10, 5))
+            plt.plot(years[1:1+len(nmi_scores)], [float(fmt(x)) for x in nmi_scores], marker='o')
+            plt.title("Community Stability Over Time (NMI, directed WCC with Leiden)")
+            plt.xlabel("Year"); plt.ylabel("NMI")
+            plt.ylim(0, 1); plt.grid(True); plt.tight_layout()
+            savefig_show()
+
+    # Robustness per year (στο πραγματικό per-year γράφημα)
+    print_header("Robustness by Year: Targeted Attacks + Random Baseline (EXACT)")
+    for year in years:
+        print_header(f"Robustness — Year {year}")
+        grp_year = aggregate_edges_df(by_year[year])
+        G_year = build_digraph_from_aggregated_df(grp_year)
+
+        if G_year.number_of_edges() == 0 or G_year.number_of_nodes() == 0:
+            print("  (No edges/nodes this year — skipping.)")
+            continue
+
+        results_year = {}
+        summary_rows_year = []
+        for strat in ["betweenness", "in_strength", "out_strength", "random"]:
+            df_att, auc_wcc, auc_scc = run_targeted_attack(
+                G_year, strategy=strat, adaptive=ADAPTIVE, tag=f"year_{year}"
+            )
+            results_year[strat] = df_att
+            steps_to_break = int(df_att["step"].iloc[-1]) if not df_att.empty else 0
+            last_wcc = df_att["wcc_fraction"].iloc[-1] if not df_att.empty else float('nan')
+            last_scc = df_att["scc_fraction"].iloc[-1] if not df_att.empty else float('nan')
+            summary_rows_year.append({
+                "year": year,
+                "strategy": strat,
+                "steps_to_break": steps_to_break,
+                "final_wcc_fraction": last_wcc,
+                "final_scc_fraction": last_scc,
+                "auc_wcc_norm": auc_wcc,
+                "auc_scc_norm": auc_scc
+            })
+
+        # Σύνοψη έτους
+        summary_df_year = pd.DataFrame(summary_rows_year).sort_values("auc_wcc_norm", ascending=False)
+        print_header(f"Robustness Summary — Year {year} (higher AUC = more robust)")
+        print(summary_df_year.to_string(index=False, float_format=lambda x: fmt(x)))
+        # Save table as CSV too
+        save_table(summary_df_year, f"robustness_summary_year_{year}.csv")
+
+        # Plots
+        if PLOT_PER_YEAR:
+            plt.figure(figsize=(10,5))
+            for strat, df_att in results_year.items():
+                if not df_att.empty:
+                    plt.plot(df_att["step"], df_att["wcc_fraction"], marker='o', linestyle='-', label=f"{strat} – WCC")
+                    plt.plot(df_att["step"], df_att["scc_fraction"], marker='x', linestyle='--', label=f"{strat} – SCC")
+            plt.xlabel("# nodes removed"); plt.ylabel("fraction of baseline")
+            plt.title(f"Robustness under targeted attacks — Year {year}")
+            plt.grid(True); plt.legend(); plt.tight_layout()
+            savefig_show()
+
+            plt.figure(figsize=(10,5))
+            for strat, df_att in results_year.items():
+                if not df_att.empty:
+                    plt.plot(df_att["step"], df_att["asp_cost"], marker='o', linestyle='-', label=f"{strat}")
+            plt.xlabel("# nodes removed"); plt.ylabel("Avg shortest path (SCC, cost-weighted)")
+            plt.title(f"Path length under attacks — Year {year}")
+            plt.grid(True); plt.legend(); plt.tight_layout()
+            savefig_show()
+
+#  NULL MODELS per year (2011–2014)
+if RUN_NULL_MODELS:
+    by_year = dict(tuple(df.groupby('YEAR', sort=True)))
+    years = sorted(by_year.keys())
+    target_years = [y for y in years if y in YEARS_FOR_NULLS]
+
+    for year in target_years:
+        print_header(f"NULL MODELS — Year {year} (generating {N_NULLS_PER_YEAR})")
+        df_year = by_year[year]
+        grp_year = aggregate_edges_df(df_year)
+        G_year = build_digraph_from_aggregated_df(grp_year)
+
+        if G_year.number_of_edges() == 0 or G_year.number_of_nodes() == 0:
+            print("  (No edges/nodes this year — skipping nulls.)")
+            continue
+
+        null_graphs = make_null_graphs_for_year(
+            G_year,
+            n_nulls=N_NULLS_PER_YEAR,
+            rewire_per_edge=REWIRES_PER_EDGE,
+            seed=NULL_RANDOM_SEED + year  # διαφορετικό seed ανά έτος
+        )
+
+        for idx, G_null in enumerate(null_graphs, start=1):
+            tag = f"year_{year}_null{idx}"
+
+            # 1) WCC/SCC
+            try:
+                largest_wcc_n = max(nx.weakly_connected_components(G_null), key=len)
+                G_wcc_n = G_null.subgraph(largest_wcc_n).copy()
+            except ValueError:
+                G_wcc_n = nx.DiGraph()
+            try:
+                largest_scc_n = max(nx.strongly_connected_components(G_null), key=len)
+                G_scc_n = G_null.subgraph(largest_scc_n).copy()
+            except ValueError:
+                G_scc_n = nx.DiGraph()
+
+            print_header(f"Null #{idx} — Year {year} | WCC={G_wcc_n.number_of_nodes()} | SCC={G_scc_n.number_of_nodes()}")
+
+            # 2) Communities (Leiden) στο WCC
+            if G_wcc_n.number_of_nodes() > 0 and G_wcc_n.number_of_edges() > 0:
+                partition_n = leiden_partition_directed_weighted(G_wcc_n, weight_attr="weight", seed=42)
+                n_communities_n = len(set(partition_n.values()))
+                print(f"  Communities: {n_communities_n}")
+            else:
+                partition_n = {}; n_communities_n = 0
+                print("  (No edges for communities)")
+
+            # 3) ASP στο SCC
+            try:
+                asp_n = nx.average_shortest_path_length(G_scc_n, weight="cost")
+                print(f"  Avg shortest path (SCC,cost): {fmt(asp_n)}")
+            except Exception as e:
+                print(f"  ASP(SCC) not available: {e}")
+
+            # 4) Κεντρικότητες στο full null γράφημα
+            in_str_n  = dict(G_null.in_degree(weight='weight'))
+            out_str_n = dict(G_null.out_degree(weight='weight'))
+            bet_n     = betweenness_cost_weighted(G_null)
+
+            print_top_list(f"Null {idx} — Top 5 In-strength",  sorted(in_str_n.items(),  key=lambda x: x[1], reverse=True)[:5])
+            print_top_list(f"Null {idx} — Top 5 Out-strength", sorted(out_str_n.items(), key=lambda x: x[1], reverse=True)[:5])
+            print_top_list(f"Null {idx} — Top 5 Betweenness",  sorted(bet_n.items(),     key=lambda x: x[1], reverse=True)[:5])
+
+            # 5) Robustness (ίδιο loop με το πραγματικό)
+            print_header(f"Robustness — Null {idx} (Year {year})")
+            results_null = {}
+            summary_null = []
+            for strat in ["betweenness", "in_strength", "out_strength", "random"]:
+                df_att, auc_wcc, auc_scc = run_targeted_attack(
+                    G_null, strategy=strat, adaptive=ADAPTIVE, tag=tag
+                )
+                results_null[strat] = df_att
+                steps_to_break = int(df_att["step"].iloc[-1]) if not df_att.empty else 0
+                last_wcc = df_att["wcc_fraction"].iloc[-1] if not df_att.empty else float('nan')
+                last_scc = df_att["scc_fraction"].iloc[-1] if not df_att.empty else float('nan')
+
+                summary_null.append({
+                    "year": year, "null_idx": idx, "strategy": strat,
+                    "steps_to_break": steps_to_break,
+                    "final_wcc_fraction": last_wcc,
+                    "final_scc_fraction": last_scc,
+                    "auc_wcc_norm": auc_wcc, "auc_scc_norm": auc_scc
+                })
+
+            # σύνοψη
+            df_sum = pd.DataFrame(summary_null).sort_values(["strategy"])
+            print_header(f"Summary — Null {idx} (Year {year})")
+            print(df_sum.to_string(index=False, float_format=lambda x: fmt(x)))
+            # Save table
+            save_table(df_sum, f"null_summary_year_{year}_null_{idx}.csv")
+
+            # (προαιρετικά) plots ανά null όπως κάνεις για τα έτη
+            if PLOT_PER_YEAR:
+                plt.figure(figsize=(10,5))
+                for strat, df_att in results_null.items():
+                    if not df_att.empty:
+                        plt.plot(df_att["step"], df_att["wcc_fraction"], marker='o', linestyle='-', label=f"{strat} – WCC")
+                        plt.plot(df_att["step"], df_att["scc_fraction"], marker='x', linestyle='--', label=f"{strat} – SCC")
+                plt.xlabel("# nodes removed"); plt.ylabel("fraction of baseline")
+                plt.title(f"Robustness — Null {idx} (Year {year})")
+                plt.grid(True); plt.legend(); plt.tight_layout()
+                savefig_show()
+
+#  END
+print(f"[INFO] Done. All outputs & plots saved under: {OUTPUT_DIR}")
